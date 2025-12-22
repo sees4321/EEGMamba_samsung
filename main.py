@@ -120,12 +120,14 @@ def main():
                     selected_streams=stream_cfg,
                     in_samples=7500, # 들어가는 data sample (fs:125에 60초)
                     num_segments=30, # 2초 단위로 30개 나누어서
-                    out_dim=32, # D는 32로 설정
+                    out_dim=64, # D는 32로 설정
                     num_tasks=len(TASK_NAMES),
                     use_dann=USE_DANN,
                     num_domains=num_subj,
                     num_experts=moe_experts,
                     moe_k=2, # top 2개만 gate에서 살리기
+                    num_heads=4,
+                    num_layers=1,
                 ).to(DEVICE)
 
                 # ─────────────────────────── training ──────────────────────────────────
