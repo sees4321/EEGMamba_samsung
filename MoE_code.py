@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
-
+import copy
 # =============================================================================
 # [Part 1] 유틸리티 & GRL
 # =============================================================================
@@ -204,8 +204,8 @@ class MoETransformerEncoderLayer(nn.Module):
 class MoETransformerEncoder(nn.Module):
     def __init__(self, encoder_layer, num_layers):
         super().__init__()
-        # Layer들을 ModuleList로 관리 (deepcopy 대신 명시적 생성 권장하지만 편의상 복사)
-        import copy
+
+
         self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.norm = nn.LayerNorm(encoder_layer.norm1.normalized_shape[0])
@@ -268,9 +268,6 @@ class Step1_Model(nn.Module):
 
         self.num_experts = num_experts
 
-        # ---------------------------------------------------------------------
-        # [수정 3] d_ff 크기 확장 (out_dim * 2 -> out_dim * 4)
-        # Transformer의 정석 비율은 4배입니다. 표현력을 높여줍니다.
         # ---------------------------------------------------------------------
         moe_layer = MoETransformerEncoderLayer(
             d_model=out_dim,
