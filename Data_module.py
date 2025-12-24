@@ -89,7 +89,7 @@ class Multi_Task_DataModule:
 
         # 1) 데이터 로드
         self.Samsung_Dataset_All, self.subj_ids, self.task_ids, self.conditions = load_db_npz(
-            r"C:\Users\User\PycharmProjects\Samsung_2024\All_in_one\multitask_Dataset.npz"
+            r"D:\KMS\samsung2024\data\multitask_Dataset.npz"
         )
 
         # 2) 채널 선택
