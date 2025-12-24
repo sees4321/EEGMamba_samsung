@@ -96,6 +96,9 @@ class TaskAwareMoE_Layer(nn.Module):
         self.k_top = k_top
         self.noisy = noisy
 
+        # [수정] 통계 집계용 변수 초기화 (기존 코드에 이 부분이 빠져있었음)
+        self.num_tasks = num_tasks
+
         # Task Embedding
         self.task_embed = nn.Embedding(num_tasks, d_model)
 
@@ -110,6 +113,13 @@ class TaskAwareMoE_Layer(nn.Module):
 
         # Shared Expert (옵션: 항상 활성화되어 기본 지식을 담당)
         self.universal_expert = ExpertMLP(d_model, d_ff, drop=drop)
+
+        # ────────── [필수 추가] 통계 집계용 Buffer 등록 ──────────
+        # 이 부분이 없으면 main.py에서 에러가 납니다.
+        self.register_buffer("expert_hist", torch.zeros(num_tasks, num_experts))
+        self.register_buffer("token_hist", torch.zeros(num_tasks))
+        self.register_buffer("univ_hist", torch.zeros(num_tasks))
+        self.track_stats = False
 
     def forward(self, x, task_ids):
         # x: (B, N, D) -> Transformer 내부의 토큰들
@@ -154,6 +164,32 @@ class TaskAwareMoE_Layer(nn.Module):
         omega = 1.0 - max_probs
 
         output = task_specific_out + omega * univ_out
+
+        # ────────── [필수 추가] 통계 집계 로직 ──────────
+        # 이 부분이 없으면 Test 결과 그래프가 모두 0으로 나옵니다.
+        if not self.training and self.track_stats:
+            with torch.no_grad():
+                B_sz, N_sz, _ = topk_idx.shape
+                task_ids_expanded = task_ids.view(B_sz, 1).expand(B_sz, N_sz)
+
+                task_ids_flat = task_ids_expanded.reshape(-1)
+                topk_flat = topk_idx.reshape(-1, k)
+                univ_weight_flat = omega.reshape(-1)
+
+                unique_tasks = torch.unique(task_ids_flat)
+
+                for t_val in unique_tasks:
+                    t_idx = t_val.long().item()
+                    mask = (task_ids_flat == t_val)
+                    if mask.sum() == 0: continue
+
+                    num_tokens = mask.sum().item()
+                    self.token_hist[t_idx] += num_tokens
+                    self.univ_hist[t_idx] += univ_weight_flat[mask].sum().item()
+
+                    selected_experts = topk_flat[mask].reshape(-1)
+                    counts = torch.bincount(selected_experts, minlength=self.num_experts)
+                    self.expert_hist[t_idx] += counts.float()
 
         return output, logits
 
