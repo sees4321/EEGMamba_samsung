@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as opt
 from torch.utils.data import DataLoader
 from utils import DEVICE
-from collections import defaultdict
+from collections import defaultdict, Counter
 from tqdm import tqdm
 
 OPT_DICT = {
@@ -16,29 +16,71 @@ OPT_DICT = {
 
 
 # -----------------------------
-# 0) Aux Loss 계산 함수
+# 0) Aux Loss 계산 함수 (기존 유지)
 # -----------------------------
 def compute_load_balancing_loss(router_logits: torch.Tensor, num_experts: int, top_k: int = 2) -> torch.Tensor:
+    """
+    [Load Balancing Aux Loss]
+    Switch Transformer / GShard 스타일의 밸런싱 손실 함수.
+
+    Args:
+        router_logits: (Batch, Seq_Len, Num_Experts) 또는 (Total_Tokens, Num_Experts)
+                       ★주의★ Softmax를 거치지 않은 Raw Logits여야 함.
+        num_experts: 전문가 수 (E)
+        top_k: 토큰당 선택하는 전문가 수 (k)
+
+    Returns:
+        aux_loss: 스칼라 Tensor
+    """
+
+    # 1. 입력 모양 평탄화 (Batch * Seq_Len, Num_Experts)
     if router_logits.dim() == 3:
         router_logits = router_logits.reshape(-1, num_experts)
 
+    # 2. P(x): 라우터가 "할당하고 싶어하는" 확률 (Soft Probability)
+    #    dim=0(배치) 평균을 내어, 각 전문가별 평균 선호도를 구함
     probs = F.softmax(router_logits, dim=-1)
-    mean_probs = torch.mean(probs, dim=0)
+    mean_probs = probs.mean(dim=0)  # Shape: (Num_Experts,)
 
+    # 3. f(x): 실제로 "할당된" 비율 (Hard Selection Fraction)
+    #    Top-k 인덱스를 뽑아서 실제 카운팅
     _, selected_experts = torch.topk(router_logits, k=top_k, dim=-1)
 
-    # num_experts 크기에 맞춰 One-hot 인코딩
+    # One-hot 변환: (Total_Tokens, k) -> (Total_Tokens, k, Num_Experts)
     expert_mask = F.one_hot(selected_experts, num_classes=num_experts).float()
 
-    tokens_per_expert = torch.sum(expert_mask, dim=1)
-    fraction_tokens = torch.mean(tokens_per_expert, dim=0)
+    # 토큰별로 어떤 전문가가 선택되었는지 합침 (Total_Tokens, Num_Experts)
+    # 예: k=2일 때, expert 1, 3이 선택되면 [0, 1, 0, 1, 0]
+    tokens_per_expert = expert_mask.sum(dim=1)
 
-    aux_loss = num_experts * torch.sum(mean_probs * fraction_tokens)
+    # 배치 전체에서 각 전문가가 선택된 '비율' 계산
+    # 주의: k=2이면 이 값들의 합은 1.0이 아니라 2.0이 됨 (이것이 표준 구현임)
+    fraction_tokens = tokens_per_expert.mean(dim=0)  # Shape: (Num_Experts,)
+
+    # 4. Loss 계산: N * sum(P_i * f_i)
+    #    목표: P_i와 f_i가 모두 균등분포(1/N)일 때 최소화됨
+    inner_prod = torch.sum(mean_probs * fraction_tokens)
+    aux_loss = num_experts * inner_prod
+
     return aux_loss
 
 
+
+def _infer_k_from_model(model, default=2):
+    actual = model.module if hasattr(model, "module") else model
+    # transformer -> first layer moe
+    if hasattr(actual, "transformer") and hasattr(actual.transformer, "layers"):
+        lyr0 = actual.transformer.layers[0]
+        if hasattr(lyr0, "moe") and hasattr(lyr0.moe, "k_top"):
+            return int(lyr0.moe.k_top)
+    # fallback
+    if hasattr(actual, "moe") and hasattr(actual.moe, "k_top"):
+        return int(actual.moe.k_top)
+    return default
+
+
 # -----------------------------
-# 1) 공통 eval 함수
+# 1) 공통 eval 함수 (수정: 5개 변수 Unpacking 대응)
 # -----------------------------
 def eval_on_loader(model: nn.Module, loader: DataLoader, criterion: nn.Module,
                    return_taskwise: bool = False, return_expert_usage: bool = False):
@@ -52,13 +94,19 @@ def eval_on_loader(model: nn.Module, loader: DataLoader, criterion: nn.Module,
     task_loss_sum = defaultdict(float)
 
     subj_expert_counts = defaultdict(lambda: defaultdict(int))
-    task_expert_counts = defaultdict(lambda: defaultdict(int))  # ★ Task별 카운트
+    task_expert_counts = defaultdict(lambda: defaultdict(int))
 
     total_univ_weight_sum = 0.0
     total_token_entries = 0
 
     with torch.no_grad():
-        for data, task_ids, label, subj_id in loader:
+        # [수정] loader가 5개를 반환할 경우 대비
+        for batch_data in loader:
+            if len(batch_data) == 5:
+                data, task_ids, label, subj_id, _ = batch_data  # 5번째(aug)는 무시
+            else:
+                data, task_ids, label, subj_id = batch_data
+
             data = {k: v.to(DEVICE) for k, v in data.items()}
             label = label.long().to(DEVICE)
             task_ids = task_ids.to(DEVICE)
@@ -89,11 +137,15 @@ def eval_on_loader(model: nn.Module, loader: DataLoader, criterion: nn.Module,
 
             # Expert Usage 집계
             if return_expert_usage and router_logits is not None:
-                k = 2
+
+                k = _infer_k_from_model(model, default=2)
+
                 if hasattr(model, 'moe') and hasattr(model.moe, 'k_top'):
                     k = model.moe.k_top
                 elif hasattr(model, 'module') and hasattr(model.module, 'moe'):
                     k = model.module.moe.k_top
+
+
 
                 probs = F.softmax(router_logits, dim=-1)
                 max_probs, topk_idx = torch.topk(probs, k=k, dim=-1)
@@ -165,7 +217,6 @@ def train_bin_cls(model: nn.Module,
                   learning_rate: str = '1e-4',
                   weight_decay: float = 0.0,
                   **kwargs):
-
     criterion = nn.CrossEntropyLoss().to(DEVICE)
     domain_criterion = nn.CrossEntropyLoss(reduction='none')
 
@@ -176,9 +227,6 @@ def train_bin_cls(model: nn.Module,
     lambda_da = kwargs.get("lambda_da", 0.1)
     aux_weight = kwargs.get("aux_weight", 0.0)
 
-    # ────────────────────────────────────────────────────────
-    # [중요] 실제 모델의 Expert 개수를 가져옵니다.
-    # ────────────────────────────────────────────────────────
     num_experts = model.module.num_experts if hasattr(model, 'module') else model.num_experts
 
     # -------------------------------------------------------
@@ -186,6 +234,8 @@ def train_bin_cls(model: nn.Module,
     tr_acc, tr_loss = [], []
     te_acc, te_loss = [], []
     tr_aux_loss_hist = []
+
+    tr_task_expert_usage_hist = defaultdict(list)
 
     te_task_acc_hist, te_task_count_hist = [], []
     te_task_loss_hist = []
@@ -195,7 +245,9 @@ def train_bin_cls(model: nn.Module,
     total_steps = num_epoch * len(train_loader)
     global_step = 0
 
-    pbar = tqdm(range(num_epoch), desc="Training", unit="epoch", ncols=120)
+    print(f"\n[Subject {kwargs.get('subject_id', 0)}] Start Training... (Total {num_epoch} Epochs)")
+
+    pbar = tqdm(range(num_epoch), desc="Training", unit="epoch", ncols=200)
 
     for epoch in pbar:
         model.train()
@@ -204,11 +256,17 @@ def train_bin_cls(model: nn.Module,
         tr_correct = 0
         tr_total = 0
 
+        epoch_task_expert_counts = defaultdict(lambda: torch.zeros(num_experts, device=DEVICE))
+
         epoch_task_correct = defaultdict(int)
         epoch_task_total = defaultdict(int)
         epoch_task_loss_sum = defaultdict(float)
 
-        for src_data, src_task_ids, src_label, src_subj in train_loader:
+        # [추가] Augmentation 통계용 Dict
+        aug_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+
+        # [수정] 5개 변수 Unpacking
+        for src_data, src_task_ids, src_label, src_subj, src_aug_types in train_loader:
             global_step += 1
             src_data = {k: v.to(DEVICE) for k, v in src_data.items()}
             src_label = src_label.long().to(DEVICE)
@@ -237,12 +295,18 @@ def train_bin_cls(model: nn.Module,
             else:
                 loss = task_loss_val
 
+            current_k = _infer_k_from_model(model, default=2)
 
-
+            # 2. Loss 계산 시 current_k를 명시적으로 전달
             if isinstance(router_logits, dict):
-                aux_loss_val = sum(compute_load_balancing_loss(l, num_experts) for l in router_logits.values())
+                aux_loss_val = sum(
+                    compute_load_balancing_loss(l, num_experts, top_k=current_k)
+                    for l in router_logits.values()
+                )
             else:
-                aux_loss_val = compute_load_balancing_loss(router_logits, num_experts)
+                aux_loss_val = compute_load_balancing_loss(
+                    router_logits, num_experts, top_k=current_k
+                )
 
                 loss += aux_weight * aux_loss_val
                 epoch_aux_sum += aux_loss_val.item()
@@ -250,13 +314,70 @@ def train_bin_cls(model: nn.Module,
             loss.backward()
             optimizer.step()
 
+            # [기존 유지] 학생이 원한 단순 Sum 방식
             trn_loss += loss.item()
+
+            # ────────── [추가] Training Expert Usage 집계 ──────────
+
+            if isinstance(router_logits, dict):
+                last_logits = list(router_logits.values())[-1]
+            else:
+                last_logits = router_logits
+
+            with torch.no_grad():
+
+                if hasattr(model, 'module'):
+                    actual_model = model.module
+                else:
+                    actual_model = model
+
+                # 기본값 설정
+                k = 2
+
+                # 모델 구조에 따라 k값 찾기
+                if hasattr(actual_model, 'moe') and hasattr(actual_model.moe, 'k_top'):
+                    k = actual_model.moe.k_top
+                elif hasattr(actual_model, 'transformer') and hasattr(actual_model.transformer, 'layers'):
+                    # Step1_Model의 일반적인 구조
+                    first_layer = actual_model.transformer.layers[0]
+                    if hasattr(first_layer, 'moe'):
+                        k = first_layer.moe.k_top
+                # [수정된 부분 End] -------------------------------------------
+
+                # 2. Top-k Indices 추출
+                # last_logits: (Batch * Segments, Experts)
+                topk_idx = torch.topk(last_logits, k=min(k, num_experts), dim=-1).indices  # (Total_Tokens, k)
+
+                curr_batch_size = src_task_ids.size(0)
+                total_tokens = last_logits.size(0)
+                segments_per_sample = total_tokens // curr_batch_size
+
+                # (Batch,) -> (Batch, Segments) -> (Total_Tokens,)
+                task_ids_expanded = src_task_ids.view(-1, 1).repeat(1, segments_per_sample).view(-1)
+
+                # 3. Task별로 루프 돌며 카운팅 (GPU 연산)
+                unique_tasks_in_batch = torch.unique(task_ids_expanded)
+                for t_val in unique_tasks_in_batch:
+                    t_id = int(t_val.item())
+                    mask = (task_ids_expanded == t_val)  # 해당 Task에 해당하는 토큰 마스크
+
+                    # 해당 Task의 Top-k 인덱스만 추출
+                    selected_experts = topk_idx[mask].view(-1)  # (Num_Filtered_Tokens * k,)
+
+                    counts = torch.bincount(selected_experts, minlength=num_experts)
+                    epoch_task_expert_counts[t_id] += counts.float()
+
+
+
+
             predicted = task_logits_src.argmax(dim=1)
             tr_correct += (predicted == src_label).sum().item()
             tr_total += src_label.size(0)
 
             with torch.no_grad():
                 loss_per_sample = F.cross_entropy(task_logits_src, src_label, reduction='none')
+
+                # [기존 유지] Task별 통계
                 for t in src_task_ids.unique():
                     mask = (src_task_ids == t)
                     t_int = int(t.item())
@@ -265,7 +386,24 @@ def train_bin_cls(model: nn.Module,
                         epoch_task_correct[t_int] += (predicted[mask] == src_label[mask]).sum().item()
                         epoch_task_loss_sum[t_int] += loss_per_sample[mask].sum().item()
 
-        # Epoch Summary
+            with torch.no_grad():
+                correct_list = (predicted == src_label).detach().cpu().tolist()
+
+                if not isinstance(src_aug_types, (list, tuple)):
+                    src_aug_types = [src_aug_types] * len(correct_list)
+
+                for a_type, is_corr in zip(list(src_aug_types), correct_list):
+                    aug_stats[a_type]['total'] += 1
+                    if is_corr:
+                        aug_stats[a_type]['correct'] += 1
+
+
+
+        for t_id in range(model.module.num_tasks if hasattr(model, 'module') else model.num_tasks):
+            cnts = epoch_task_expert_counts[t_id].cpu().numpy()  # (Num_Experts,)
+            tr_task_expert_usage_hist[t_id].append(cnts)
+
+        # Epoch Summary (기존 방식 유지)
         epoch_tr_loss = round(trn_loss / len(train_loader), 4)
         epoch_tr_acc = round(100 * tr_correct / tr_total, 4) if tr_total > 0 else 0.0
         avg_aux_loss = epoch_aux_sum / len(train_loader)
@@ -292,15 +430,30 @@ def train_bin_cls(model: nn.Module,
         te_task_count_hist.append(epoch_task_count)
         te_task_loss_hist.append(epoch_task_loss)
 
-        pbar.set_postfix({
-            'Tr_Loss': f"{epoch_tr_loss:.4f}",
-            'Tr_Acc': f"{epoch_tr_acc:.2f}%",  # 이 줄 추가
-            'Te_Loss': f"{epoch_te_loss:.4f}",  # 이 줄 추가
-            'Te_Acc': f"{epoch_te_acc:.2f}%",
-            'Aux': f"{avg_aux_loss:.3f}"  # (선택 사항) Aux Loss도 보고 싶다면 추가
-        })
+        # [추가/수정] Augmentation 로그 문자열 생성 (있는 것만 표시)
+        abbr = {'original': 'orig', 'noise': 'nois', 'shift': 'shft', 'crop': 'crop', 'mask': 'mask'}
+        order = ['original', 'noise', 'shift', 'crop', 'mask']
+        parts = []
 
-    # Final Summary
+        for k in order:
+            if k in aug_stats and aug_stats[k]['total'] > 0:
+                acc_k = 100.0 * aug_stats[k]['correct'] / aug_stats[k]['total']
+                parts.append(f"{abbr.get(k, k[:4])}:{acc_k:.1f}%")
+
+        aug_short_str = " ".join(parts)
+
+        pbar.set_postfix({
+            'TrL': f"{epoch_tr_loss:.3f}",
+            'TrA': f"{epoch_tr_acc:.1f}%",
+            'TeL': f"{epoch_te_loss:.3f}",
+            'TeA': f"{epoch_te_acc:.1f}%"
+        }, refresh=False)
+
+        pbar.set_postfix_str(
+            f"TrL={epoch_tr_loss:.3f} TrA={epoch_tr_acc:.1f}% TeL={epoch_te_loss:.3f} TeA={epoch_te_acc:.1f}% | Aug={aug_short_str}",
+            refresh=True)
+
+    # Final Summary (기존 유지)
     final_tr_task_acc = tr_task_acc_hist[-1] if tr_task_acc_hist else {}
     final_te_task_acc = te_task_acc_hist[-1] if te_task_acc_hist else {}
 
@@ -330,10 +483,11 @@ def train_bin_cls(model: nn.Module,
     return tr_acc, tr_loss, te_acc, te_loss, \
         te_task_acc_hist, te_task_count_hist, te_task_loss_hist, tr_aux_loss_hist, \
         test_expert_counts, test_task_expert_counts, test_univ_ratio, \
-        tr_task_acc_hist, tr_task_loss_hist
+        tr_task_acc_hist, tr_task_loss_hist, tr_task_expert_usage_hist
+
 
 # -----------------------------
-# 3) 최종 Test 함수 (기존 유지)
+# 3) 최종 Test 함수 (수정: 5개 변수 Unpacking 대응)
 # -----------------------------
 def test_bin_cls(model: nn.Module, tst_loader: DataLoader):
     model.eval()
@@ -347,7 +501,13 @@ def test_bin_cls(model: nn.Module, tst_loader: DataLoader):
     task_ids_all = np.array([])
 
     with torch.no_grad():
-        for data, task_ids, label, subj_id in tst_loader:
+        # [수정] 5개 변수 대응
+        for batch_data in tst_loader:
+            if len(batch_data) == 5:
+                data, task_ids, label, subj_id, _ = batch_data
+            else:
+                data, task_ids, label, subj_id = batch_data
+
             data = {k: v.to(DEVICE) for k, v in data.items()}
             label = label.long().to(DEVICE)
             task_ids = task_ids.to(DEVICE)

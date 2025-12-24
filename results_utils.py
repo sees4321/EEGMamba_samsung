@@ -3,6 +3,55 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+import torch
+
+
+
+
+def _get_all_moe_modules(model):
+    moe_list = []
+    if hasattr(model, 'transformer') and hasattr(model.transformer, 'layers'):
+        for layer in model.transformer.layers:
+            if hasattr(layer, 'moe'):
+                moe_list.append(layer.moe)
+    if hasattr(model, 'moe'):
+        moe_list.append(model.moe)
+
+    # de-duplicate
+    uniq = []
+    seen = set()
+    for m in moe_list:
+        if id(m) not in seen:
+            uniq.append(m)
+            seen.add(id(m))
+    return uniq
+
+
+def _aggregate_moe_stats(moe_list):
+    """
+    Returns:
+      agg_expert_hist: torch.Tensor (T, E)
+      agg_token_hist : torch.Tensor (T,)
+      agg_univ_hist  : torch.Tensor (T,)
+      num_tasks, num_experts
+    """
+    if len(moe_list) == 0:
+        return None, None, None, None, None
+
+    T, E = moe_list[0].expert_hist.shape
+    device = moe_list[0].expert_hist.device
+
+    agg_expert = torch.zeros((T, E), device=device)
+    agg_token  = torch.zeros((T,), device=device)
+    agg_univ   = torch.zeros((T,), device=device)
+
+    for moe in moe_list:
+        agg_expert += moe.expert_hist
+        agg_token  += moe.token_hist
+        agg_univ   += moe.univ_hist
+
+    return agg_expert, agg_token, agg_univ, T, E
+
 
 def process_subject_after_test(
         subj,
@@ -43,14 +92,31 @@ def process_subject_after_test(
     os.makedirs(ratio_dir, exist_ok=True)
 
     # 모델에서 MoE 모듈 가져오기
-    if hasattr(model, 'moe'):
-        moe_module = model.moe
-    else:
-        # Fallback
-        moe_module = model
+    ratio_dir = os.path.join(subj_dir, "expert_ratio")
+    os.makedirs(ratio_dir, exist_ok=True)
 
-    num_tasks_moe = moe_module.num_tasks
-    num_experts_moe = moe_module.num_experts
+
+
+
+
+    # [수정됨] 모델 구조에 맞춰 실제 MoE 모듈 탐색 (Step1_Model 대응)
+    moe_list = _get_all_moe_modules(model)
+    agg_expert_hist, agg_token_hist, agg_univ_hist, num_tasks_moe, num_experts_moe = _aggregate_moe_stats(moe_list)
+
+    if agg_expert_hist is None:
+        print("[WARN] No MoE modules found for stats.")
+        return (
+            global_expert_hist, global_token_hist, global_univ_hist,
+            per_subj_expert_hist, per_subj_token_hist, per_subj_univ_hist
+        )
+
+    # move to cpu numpy once
+    agg_expert_np = agg_expert_hist.detach().cpu().numpy()
+    agg_token_np = agg_token_hist.detach().cpu().numpy()
+    agg_univ_np = agg_univ_hist.detach().cpu().numpy()
+
+
+
 
     # --- [초기화] Global Buffer (첫 Subj 실행 시) ---
     if global_expert_hist is None:
@@ -67,20 +133,19 @@ def process_subject_after_test(
     valid_task_ids_subj = sorted(valid_task_ids)
 
     for task_id in valid_task_ids_subj:
+
+
         # 모델의 버퍼에서 값 가져오기
-        expert_counts = moe_module.expert_hist[task_id].cpu().numpy()  # (E,)
-        total_tokens = moe_module.token_hist[task_id].item()  # Scalar
-        univ_sum = moe_module.univ_hist[task_id].item()  # Scalar
+        expert_counts = agg_expert_np[task_id]  # (E,)
+        total_tokens = expert_counts.sum()
+        univ_sum = float(agg_univ_np[task_id])
 
         if total_tokens <= 0:
             continue
 
-        # --- 비율 계산 ---
-        # 1. Expert Selection Ratio
         expert_ratios = expert_counts / total_tokens
-
-        # 2. Universal Weight Average
         avg_univ_weight = univ_sum / total_tokens
+
 
         # --- 누적 (Accumulate) ---
         global_expert_hist[task_id] += expert_counts
@@ -658,50 +723,59 @@ def save_aux_loss_curve(
     plt.close()
 
 
-def save_subject_expert_ratio(subj_dir, subj, expert_counts, num_experts, univ_ratio=None):
+def save_task_wise_expert_ratio(subj_dir, subj, test_task_expert_counts, num_experts, task_names, univ_ratio=None):
     """
-    [수정] univ_ratio(평균 Universal Expert 비중, %)가 들어오면 빨간 점선으로 표시합니다.
+    Task별로 Expert 선택 비율(Bar Chart)을 각각 저장합니다.
+    test_task_expert_counts: { task_id: { expert_id: count } }
     """
-    os.makedirs(subj_dir, exist_ok=True)
+    ratio_dir = os.path.join(subj_dir, "expert_ratio_plots")
+    os.makedirs(ratio_dir, exist_ok=True)
 
-    # 총 샘플 수 계산
-    total_samples = sum(expert_counts.values())
-    if total_samples == 0:
-        return
+    sorted_tasks = sorted(test_task_expert_counts.keys())
 
-    # 비율 계산
-    ratios = []
-    for i in range(num_experts):
-        count = expert_counts.get(i, 0)
-        ratios.append(100.0 * count / total_samples)
+    for t_id in sorted_tasks:
+        counts_dict = test_task_expert_counts[t_id]
+        total_samples = sum(counts_dict.values())
 
-    # 그래프 그리기
-    plt.figure(figsize=(10, 8), dpi=300)
-    bars = plt.bar(range(num_experts), ratios, color='skyblue', edgecolor='black', alpha=0.8)
+        if total_samples == 0:
+            continue
 
-    plt.ylim(0, 105)
-    plt.xlabel("Expert Index", fontsize=14)
-    plt.ylabel("Selection Ratio (%)", fontsize=14)
-    plt.title(f"Subject {subj} Expert Selection Ratio", fontsize=16)
-    plt.xticks(range(num_experts), fontsize=12)
-    plt.grid(axis='y', linestyle='--', alpha=0.5)
+        # 비율 계산 (분모: 해당 Task에서의 Total Selection)
+        ratios = []
+        for i in range(num_experts):
+            ratios.append(100.0 * counts_dict.get(i, 0) / total_samples)
 
-    # 바 위에 수치 표시
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2.0, height + 1,
-                 f'{height:.1f}%', ha='center', va='bottom', fontsize=12)
+        t_name = task_names.get(t_id, f"Task {t_id}")
 
-    # ★ [추가된 부분] Universal Expert Ratio (빨간 점선)
-    if univ_ratio is not None:
-        plt.axhline(y=univ_ratio, color='red', linestyle='--', linewidth=2, label=f'Universal ({univ_ratio:.1f}%)')
-        # 범례 표시 (오른쪽 상단)
-        plt.legend(loc='upper right', fontsize=12)
+        plt.figure(figsize=(8, 6))
+        bars = plt.bar(range(num_experts), ratios, color='skyblue', edgecolor='black', alpha=0.8)
 
-    plt.tight_layout()
-    save_path = os.path.join(subj_dir, f"subj_{subj:02d}_expert_ratio.png")
-    plt.savefig(save_path)
-    plt.close()
+        plt.ylim(0, 105)
+        plt.xlabel("Expert Index")
+        plt.ylabel("Selection Ratio (%)")
+        plt.title(f"Subj {subj:02d} | Task: {t_name}\nExpert Selection Ratio")
+        plt.xticks(range(num_experts))
+        plt.grid(axis='y', linestyle='--', alpha=0.5)
+
+        # 바 위에 수치 표시
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                plt.text(bar.get_x() + bar.get_width() / 2.0, height + 1,
+                         f'{height:.1f}%', ha='center', va='bottom', fontsize=10)
+
+        # Universal Ratio (전체 평균 혹은 Task별 평균이 있다면 표시 - 여기선 Global 평균만 있다고 가정 시 생략 혹은 표시)
+        if univ_ratio is not None:
+            plt.axhline(y=univ_ratio, color='red', linestyle='--', linewidth=2,
+                        label=f'Univ (Global) {univ_ratio:.1f}%')
+            plt.legend()
+
+        plt.tight_layout()
+        save_path = os.path.join(ratio_dir, f"subj_{subj:02d}_task_{t_id}_{t_name}_ratio.png")
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+
+
 
 
 def save_task_metrics_plot(history, tasks, save_dir='./results/plots'):
@@ -813,6 +887,7 @@ def save_and_aggregate_subject_results(
         test_loss_hist,
         tr_task_acc_hist,
         tr_task_loss_hist,
+        tr_task_expert_usage_hist,
         te_task_acc_hist,
         te_task_loss_hist,
         te_task_count_hist,
@@ -824,13 +899,8 @@ def save_and_aggregate_subject_results(
         task_epoch_acc_sum,
         task_epoch_subj_cnt,
         task_epoch_loss_sum,
-        task_epoch_loss_subj_cnt
+        task_epoch_loss_subj_cnt,
 ):
-    """
-    [기능]
-    1. 피험자별 각종 학습 곡선(Loss, Acc, Task-wise, Aux 등) 및 Heatmap 저장
-    2. 전체 피험자 평균 곡선을 그리기 위한 전역 버퍼(Global Accumulator) 누적 업데이트
-    """
 
     # 1. 기본 Subject Curves 저장
     subj_dir = save_subject_curves(
@@ -873,11 +943,12 @@ def save_and_aggregate_subject_results(
     )
 
     # 4. Expert Ratio 저장
-    save_subject_expert_ratio(
+    save_task_wise_expert_ratio(
         subj_dir=subj_dir,
         subj=subj,
-        expert_counts=test_expert_counts[subj],
+        test_task_expert_counts=test_task_expert_counts,  # Task별 카운트 전달
         num_experts=moe_experts,
+        task_names=task_names,
         univ_ratio=test_univ_ratio
     )
 
@@ -899,6 +970,15 @@ def save_and_aggregate_subject_results(
         num_epochs=num_epochs,
         te_task_loss_hist=te_task_loss_hist,
         task_names=task_names,
+    )
+
+    # [추가] Training Evolution 그래프 저장 호출
+    save_training_task_expert_evolution(
+        base_dir=subj_dir,
+        subj=subj,
+        tr_task_expert_usage_hist=tr_task_expert_usage_hist,
+        num_experts=moe_experts,
+        task_names=task_names
     )
 
     # 7. 전역 버퍼 누적 (In-place update)
@@ -1019,6 +1099,51 @@ def summarize_and_save_results(
         task_names=task_names,
     )
 
+
+def save_training_task_expert_evolution(base_dir, subj, tr_task_expert_usage_hist, num_experts, task_names):
+    """
+    [Task별 분리] 학습 진행(Epoch)에 따른 Expert 선택 비율 변화 (Stacked Area Plot)
+    tr_task_expert_usage_hist: dict { task_id: [ (num_experts,), ... (epoch 수 만큼) ] }
+    """
+    if not tr_task_expert_usage_hist:
+        return
+
+    # 저장 폴더 생성
+    evol_dir = os.path.join(base_dir, "training_evolution")
+    os.makedirs(evol_dir, exist_ok=True)
+
+    # 각 Task별로 그래프 생성
+    for t_id, history_list in tr_task_expert_usage_hist.items():
+        # 데이터가 하나도 없거나(0), 모든 에포크가 0인 경우 스킵
+        data = np.array(history_list)  # (Num_Epochs, Num_Experts)
+        if data.sum() == 0:
+            continue
+
+        # Normalize (Epoch별 비율 변환)
+        row_sums = data.sum(axis=1, keepdims=True)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratios = np.where(row_sums > 0, data / row_sums, 0) * 100.0
+
+        epochs = np.arange(1, len(ratios) + 1)
+
+        plt.figure(figsize=(10, 6))
+        labels = [f"Expert {i}" for i in range(num_experts)]
+
+        # Stackplot
+        plt.stackplot(epochs, ratios.T, labels=labels, alpha=0.8)
+
+        t_name = task_names.get(t_id, f"Task {t_id}")
+
+        plt.xlabel("Epochs")
+        plt.ylabel("Selection Ratio (%)")
+        plt.title(f"Subj {subj:02d} | Task: {t_name} | Expert Evolution")
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize='small')
+        plt.margins(0, 0)
+        plt.tight_layout()
+
+        save_path = os.path.join(evol_dir, f"subj_{subj:02d}_task_{t_id}_{t_name}_evolution.png")
+        plt.savefig(save_path, dpi=150)
+        plt.close()
 
 
 # if __name__ == "__main__":

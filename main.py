@@ -1,7 +1,7 @@
 import os
 from collections import defaultdict
 from utils import *
-from Data_module import Multi_Task_DataModule
+from Data_module import Multi_Task_DataModule, Multi_Task_DataModule_Expansion, Multi_Task_DataModule_SlidingWindow
 from MoE_code import Step1_Model
 from trainer import train_bin_cls, test_bin_cls
 from results_utils import (
@@ -28,7 +28,7 @@ ROOT_BASE_DIR = r"C:\Users\User\PycharmProjects\Samsung_2024\All_in_one"
 # ─────────── 수정 가능한 parameter ─────────────────────────────────
 
 CHANNEL_MODE = 0
-batch = 32
+batch = 64
 num_epochs = 200
 learning_rate = 5e-4
 
@@ -38,7 +38,7 @@ STREAM_CONFIGS = [
     ["raw", "delta", "theta", "alpha", "lowb", "highb"],
 ]
 
-MOE_EXPERT_CANDIDATES = [3]
+MOE_EXPERT_CANDIDATES = [5]
 
 USE_TASK_IDS = [0, 1, 2, 4]
 
@@ -47,6 +47,10 @@ LAMBDA_DA = 0.1
 
 AUX_WEIGHT = 0.0
 
+use_noise=False # True, False
+use_shift=False
+use_crop=False
+use_mask=False
 
 # ─────────── Main ─────────────────────────────────
 def main():
@@ -97,12 +101,27 @@ def main():
             # ============= Subject loop =============
             for subj in range(num_subj):
 
-                Multi_Task_dataset = Multi_Task_DataModule(
+                # Multi_Task_dataset = Multi_Task_DataModule(
+                #     test_subj=subj,
+                #     channel_mode=CHANNEL_MODE,
+                #     batch=batch,
+                #     use_task_ids=USE_TASK_IDS,
+                # )
+
+                Multi_Task_dataset = Multi_Task_DataModule_Expansion(
                     test_subj=subj,
                     channel_mode=CHANNEL_MODE,
                     batch=batch,
                     use_task_ids=USE_TASK_IDS,
+
+                    # ★ 여기서 원하는 증강만 True로 설정 ★
+                    use_noise=use_noise,
+                    use_shift=use_shift,
+                    use_crop=use_crop,
+                    use_mask=use_mask
                 )
+
+
                 train_loader = Multi_Task_dataset.train_loader
                 test_loader = Multi_Task_dataset.test_loader
 
@@ -113,13 +132,13 @@ def main():
                 used_subjects.append(subj) # 일부 task만 사용할 때 대비용
 
                 valid_task_ids = set() # test 피험자에게 있는 task에 대해서만 정확도 확인
-                for _, task_ids, _, _ in test_loader:
+                for _, task_ids, _, _, _ in test_loader:
                     valid_task_ids.update(task_ids.tolist())
 
                 model = Step1_Model(
                     selected_streams=stream_cfg,
                     in_samples=7500, # 들어가는 data sample (fs:125에 60초)
-                    num_segments=30, # 2초 단위로 30개 나누어서
+                    num_segments=20, # 3초 단위로 20개 나누어서
                     out_dim=64, # D는 32로 설정
                     num_tasks=len(TASK_NAMES),
                     use_dann=USE_DANN,
@@ -135,7 +154,7 @@ def main():
                 train_acc, train_loss, test_acc_hist, test_loss_hist, \
                     te_task_acc_hist, te_task_count_hist, te_task_loss_hist, tr_aux_loss_hist, \
                     test_expert_counts, test_task_expert_counts, test_univ_ratio, \
-                    tr_task_acc_hist, tr_task_loss_hist =train_bin_cls(
+                    tr_task_acc_hist, tr_task_loss_hist, tr_task_expert_usage_hist =train_bin_cls(
                     model,
                     train_loader=train_loader,
                     test_loader=test_loader,
@@ -167,6 +186,7 @@ def main():
                     train_acc=train_acc, train_loss=train_loss,
                     test_acc_hist=test_acc_hist, test_loss_hist=test_loss_hist,
                     tr_task_acc_hist=tr_task_acc_hist, tr_task_loss_hist=tr_task_loss_hist,
+                    tr_task_expert_usage_hist=tr_task_expert_usage_hist,
                     te_task_acc_hist=te_task_acc_hist, te_task_loss_hist=te_task_loss_hist,
                     te_task_count_hist=te_task_count_hist, tr_aux_loss_hist=tr_aux_loss_hist,
                     test_expert_counts=test_expert_counts, test_task_expert_counts=test_task_expert_counts,
@@ -180,14 +200,35 @@ def main():
                 best_path = r'C:\Users\User\PycharmProjects\Samsung_2024\All_in_one\best_model.pth'
                 model.load_state_dict(torch.load(best_path))
 
-                if hasattr(model, 'moe'): # moe 관련 요소들 저장하기 위해서
-                    model.moe.track_stats = True
-                    if hasattr(model.moe, 'expert_hist'):
-                        model.moe.expert_hist.zero_()
-                    if hasattr(model.moe, 'token_hist'):
-                        model.moe.token_hist.zero_()
-                    if hasattr(model.moe, 'univ_hist'):
-                        model.moe.univ_hist.zero_()
+                # --- enable/reset MoE stats for ALL layers ---
+                moe_list = []
+
+                if hasattr(model, 'transformer') and hasattr(model.transformer, 'layers'):
+                    for layer in model.transformer.layers:
+                        if hasattr(layer, 'moe'):
+                            moe_list.append(layer.moe)
+
+                # (optional) if model has a direct moe too
+                if hasattr(model, 'moe'):
+                    moe_list.append(model.moe)
+
+                # remove duplicates (safe)
+                uniq = []
+                seen = set()
+                for m in moe_list:
+                    if id(m) not in seen:
+                        uniq.append(m)
+                        seen.add(id(m))
+                moe_list = uniq
+
+                for moe in moe_list:
+                    moe.track_stats = True
+                    if hasattr(moe, 'expert_hist'):
+                        moe.expert_hist.zero_()
+                    if hasattr(moe, 'token_hist'):
+                        moe.token_hist.zero_()
+                    if hasattr(moe, 'univ_hist'):
+                        moe.univ_hist.zero_()
 
 
                 # ─────────────────────────── test ──────────────────────────────────
@@ -201,7 +242,9 @@ def main():
                     per_subj_task_acc[subj, t] = acc
                     per_subj_task_n[subj, t] = task_count[t]
 
-                has_moe_stats = hasattr(model, 'expert_hist') and hasattr(model, 'num_experts')
+
+                from results_utils import _get_all_moe_modules
+                has_moe_stats = len(_get_all_moe_modules(model)) > 0
 
                 if has_moe_stats:
                     global_expert_hist, global_token_hist, global_univ_hist, \
@@ -230,10 +273,9 @@ def main():
                 else:
                     for t_id, cnt in task_count.items():
                         if t_id in TASK_NAMES:
-                            t_name = TASK_NAMES[t_id]
                             correct_count = int(cnt * (task_acc[t_id] / 100.0))
-                            global_task_correct[t_name] += correct_count
-                            global_task_total[t_name] += cnt
+                            global_task_correct[t_id] += correct_count
+                            global_task_total[t_id] += cnt
 
             # ============= Summary Section =============
 
